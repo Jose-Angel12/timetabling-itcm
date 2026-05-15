@@ -1,0 +1,7 @@
+REPORTE DE FACTIBILIDAD
+=======================
+
+Demanda total: 645
+Capacidad total profes: 7275
+Sum MinH: 0   Sum MaxH: 2425
+

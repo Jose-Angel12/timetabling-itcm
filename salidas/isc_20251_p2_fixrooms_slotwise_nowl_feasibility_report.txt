@@ -1,0 +1,12 @@
+REPORTE DE FACTIBILIDAD
+=======================
+
+Demanda total: 645
+Capacidad total profes: 7275
+Sum MinH: 0   Sum MaxH: 2425
+
+Profes SIN cursos candidatos (MinH indicado entre paréntesis):
+  LEGM970511KM5 (MinH=0)
+  OOBF6006267N2 (MinH=0)
+  PONI570710GL0 (MinH=0)
+

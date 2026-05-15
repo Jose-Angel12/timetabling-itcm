@@ -1,0 +1,2 @@
+Se exportó el calendario fuente como fallback porque el solver no produjo incumbente exportable.
+Fuente: salidas\isc_20251_20251_calendario.csv

@@ -1,0 +1,4 @@
+CHEQUEO SINGLE_ROOM_PER_COURSE
+=============================
+
+OK: todos los cursos usan una sola aula en el calendario exportado.

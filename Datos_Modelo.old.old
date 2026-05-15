@@ -1,0 +1,741 @@
+# build_datos_modelo_isc.py
+# ---------------------------------------------------------------
+# Lee la BD 'bdtec' y arma conjuntos/parámetros mínimos para el
+# modelo, SOLO para ING. EN SISTEMAS COMPUTACIONALES (ISC).
+# Escribe: salidas/datos_modelo_{periodo}.json (o varios si MULTI_PERIODS)
+#
+# v3.4 (ISC estricto/permisivo)
+#  - Clave de grupo compuesta g_key = GRUPO|CARRERA|RETICULA|SEMESTRE|TURNO|PERIODO
+#  - Hreq reales tomados de BD si existen columnas (horas_semana/hreq/horas)
+#  - Listas de aulas AT/AL fijas por .env (STRICT_ROOMSETS=1) o permisivo (0)
+#  - D/H forzables por .env: FORCE_D_FROM_ENV, FORCE_H_FROM_ENV ("07-21")
+#    * fallback: H_OVERRIDE=N (bloques 01..N) o default 7 bloques si no hay cat.
+#  - A_tipo se completa con AT/AL
+#  - Extracción por rutas: vista -> join g→c -> join g→mc→c -> fallback periodo
+#  - a_pm base por experiencia directa observada (p,m) en datos
+# ---------------------------------------------------------------
+
+import os
+import re
+import json
+import mysql.connector
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =============================
+# Utilidades generales
+# =============================
+def _N(x):
+    return str(x or "").strip().upper()
+
+def _n(x):
+    return str(x or "").strip()
+
+def _safe_int(x, default=None):
+    try:
+        return int(x) if x is not None else default
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+def _env_list(key, default=None):
+    raw = os.getenv(key, "") or ""
+    if not raw.strip():
+        return (default[:] if default else [])
+    return [_N(t) for t in re.split(r"[\s,;]+", raw.strip()) if t]
+
+def _parse_h_range(hspec: str):
+    v = (hspec or "").strip()
+    if not v:
+        return None
+    m = re.match(r"^(\d{1,2})\s*[-:]\s*(\d{1,2})$", v)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    if a > b:
+        a, b = b, a
+    return [f"{h:02d}" for h in range(a, b + 1)]
+
+def _norm_period(s):
+    return re.sub(r"\D", "", (s or "").strip())
+
+def _mk_gkey(grupo, carrera, reticula, semestre, turno, periodo):
+    return "|".join([_N(grupo), _N(carrera), _N(reticula), _N(semestre), _N(turno), _N(periodo)])
+
+# =============================
+# Config DB
+# =============================
+DB_CFG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", "3306")),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_NAME", "bdtec"),
+}
+for _k in ("DB_USER", "DB_NAME"):
+    if not os.getenv(_k):
+        raise RuntimeError(f"Variable de entorno faltante: {_k}")
+
+# =============================
+# Parámetros del modelo (.env)
+# =============================
+TARGET_PERIOD       = _norm_period(os.getenv("TARGET_PERIOD", os.getenv("MODEL_PERIODO", "20251"))) or "20251"
+ONLY_TARGET_PERIOD  = os.getenv("ONLY_TARGET_PERIOD", "1").lower() in ("1", "true", "yes")
+MULTI_PERIODS_RAW   = ("" if ONLY_TARGET_PERIOD else (os.getenv("MULTI_PERIODS") or "").strip())
+
+DEFAULT_GROUP_SIZE  = _safe_int(os.getenv("DEFAULT_GROUP_SIZE"), 30)
+DEFAULT_AULA_CAP    = _safe_int(os.getenv("DEFAULT_AULA_CAP"), 35)
+DEFAULT_HREQ        = _safe_int(os.getenv("DEFAULT_HREQ"), 3)
+DEFAULT_MINH        = _safe_int(os.getenv("DEFAULT_MINH"), 2)
+DEFAULT_MAXH        = _safe_int(os.getenv("DEFAULT_MAXH"), 20)
+
+# Costos de afinidad (menor = mejor)
+A_PM_DIRECTA = 10
+A_PM_NINGUNA = 1000
+
+CAREER_LEVEL_CODE   = os.getenv("MODEL_NIVEL", "L")
+CAREER_NAME_KEYWORD = os.getenv("MODEL_CARRERA_LIKE", "SISTEM")
+CAREER_ID_PAIRS_RAW = (os.getenv("MODEL_CARRERA_IDS") or "").strip()  # "8:50,19:11"
+
+# Aulas listas fijas ISC
+DEFAULT_AT = ["FF1","FF2","FF3","FF4","FF5","FF6","FF7","FF8","FF9","FFA","FFB","FFC","FFD"]
+DEFAULT_AL = list("ABCDEFGHI")
+AT_CONF    = set(_env_list("MODEL_AT_LIST", DEFAULT_AT))
+AL_CONF    = set(_env_list("MODEL_AL_LIST", DEFAULT_AL))
+SEM1_EXTRAS = _env_list("SEM1_EXTRAS", [])  # E,F o tokens con *
+
+STRICT_ROOMSETS = os.getenv("STRICT_ROOMSETS", "1").lower() in ("1","true","yes")
+EF_SELECTION_COUNT = _safe_int(os.getenv("EF_SELECTION_COUNT"), 0)
+
+# D/H forzables
+FORCE_D = _env_list("FORCE_D_FROM_ENV", [])
+FORCE_H = _parse_h_range(os.getenv("FORCE_H_FROM_ENV", ""))
+H_OVERRIDE = _safe_int(os.getenv("H_OVERRIDE", None), None)
+FORCE_H_07_21 = os.getenv("FORCE_H_07_21", "0").lower() in ("1","true","yes")
+
+DATOS_JSON_TPL = os.getenv("DATOS_JSON", "salidas/datos_modelo_{periodo}.json")
+
+# =============================
+# Conexión y helpers SQL
+# =============================
+conn = mysql.connector.connect(**DB_CFG)
+cur  = conn.cursor()
+schema = DB_CFG["database"]
+
+def _cols(table):
+    cur.execute(f"DESCRIBE `{schema}`.`{table}`")
+    return [r[0] for r in cur.fetchall()]
+
+def _has_rel(name):
+    cur.execute("""
+        SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s
+    """, (schema, name))
+    return cur.fetchone()[0] > 0
+
+def _has_view(name):
+    cur.execute("""
+        SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS
+        WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s
+    """, (schema, name))
+    return cur.fetchone()[0] > 0
+
+def _pick(cols, candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+def _fetchall(sql, params=None):
+    cur.execute(sql, params or ())
+    return cur.fetchall()
+
+def _scalar(sql, params=None):
+    cur.execute(sql, params or ())
+    row = cur.fetchone()
+    return (row[0] if row else None)
+
+# =============================
+# Aulas y horarios base (A, D, H)
+# =============================
+print("\n=== Catálogo de aulas configuradas (AT/AL) ===")
+print("AT =", ", ".join(sorted(AT_CONF)))
+print("AL =", ", ".join(sorted(AL_CONF)))
+print(f"STRICT_ROOMSETS = {'ON' if STRICT_ROOMSETS else 'OFF'}")
+
+A_db = []
+cap_A_db = {}
+if _has_rel("aulas"):
+    cols = _cols("aulas")
+    col_a = _pick(cols, ["aula","clave","id_aula","codigo"])    
+    col_c = _pick(cols, ["capacidad","capacidad_aula","cupo"])    
+    if col_a:
+        rows = _fetchall(f"SELECT `{col_a}`{(','+' ,`'+col_c+'`') if col_c else ''} FROM `{schema}`.`aulas`")
+        for r in rows:
+            a = _N(r[0])
+            if not a:
+                continue
+            if a not in A_db:
+                A_db.append(a)
+            cap = _safe_int(r[1], DEFAULT_AULA_CAP) if (col_c and len(r) > 1) else DEFAULT_AULA_CAP
+            cap_A_db[a] = cap
+else:
+    print("Info: no hay tabla 'aulas'; usaré catálogos de .env")
+
+def _build_A_tipo(A_list):
+    out = {}
+    for a in A_list:
+        if a in AT_CONF:
+            out[a] = "T"
+        elif a in AL_CONF:
+            out[a] = "L"
+        else:
+            out[a] = "T"
+    return out
+
+# Días
+if FORCE_D:
+    D = FORCE_D[:]
+    print("FORCE_D_FROM_ENV -> D =", D)
+elif _has_rel("dias"):
+    cols = _cols("dias")
+    col_d = _pick(cols, ["dia","nombre","clave","id"])    
+    if col_d:
+        D = [_N(r[0])[:1] for r in _fetchall(f"SELECT `{col_d}` FROM `{schema}`.`dias`")]
+        D = [d for d in D if d in ("L","M","X","J","V","S")]
+        if not D:
+            D = ["L","M","X","J","V"]
+    else:
+        D = ["L","M","X","J","V"]
+        print("'dias' sin columna reconocible; uso default", D)
+else:
+    D = ["L","M","X","J","V"]
+    print("Info: no hay 'dias'; uso default", D)
+
+# Horas/bloques (cadena HH)
+if FORCE_H is not None:
+    H = FORCE_H[:]
+    print("FORCE_H_FROM_ENV -> H =", H)
+elif FORCE_H_07_21:
+    H = [f"{h:02d}" for h in range(7,22)]
+    print("FORCE_H_07_21=ON -> H =", H)
+elif _has_rel("itcm_horas"):
+    cols = _cols("itcm_horas")
+    col_h = _pick(cols, ["hora","numero","id_hora"])    
+    if col_h:
+        hrs = [_safe_int(r[0], None) for r in _fetchall(f"SELECT `{col_h}` FROM `{schema}`.`itcm_horas` ORDER BY `{col_h}`")]
+        hrs = [h for h in hrs if h is not None]
+        H = [f"{int(h):02d}" for h in hrs]
+    else:
+        H = [f"{i:02d}" for i in range(1, 1 + (_safe_int(_scalar(f"SELECT COUNT(*) FROM `{schema}`.`itcm_horas`"), 7)))]
+        print("'itcm_horas' sin columna reconocible; H=", H)
+else:
+    if H_OVERRIDE and H_OVERRIDE > 0:
+        H = [f"{i:02d}" for i in range(1, H_OVERRIDE + 1)]
+        print("H_OVERRIDE -> H =", H)
+    else:
+        H = [f"{i:02d}" for i in range(1, 8)]
+        print("Info: sin catálogo de horas; H=", H)
+
+# =============================
+# Periodos a procesar
+# =============================
+print("\n=== Selección de periodo(s) ===")
+
+def _detect_period_col():
+    if not _has_rel("grupos"):
+        return None
+    return _pick(_cols("grupos"), ["periodo"])    
+
+def _periods_from_db(limit=None):
+    colp = _detect_period_col()
+    if not colp:
+        return []
+    sql = f"SELECT DISTINCT `{colp}` FROM `{schema}`.`grupos` ORDER BY `{colp}` DESC"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    rows = _fetchall(sql)
+    return [str(r[0]) for r in rows if r and r[0] is not None]
+
+
+def _parse_multi(raw):
+    if not raw:
+        return []
+    up = raw.upper()
+    if up == "ALL":
+        return _periods_from_db()
+    if up.startswith("ALL_LAST:"):
+        try:
+            n = int(up.split(":",1)[1])
+        except Exception:
+            n = 6
+        return _periods_from_db(limit=n)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+period_list = []
+if MULTI_PERIODS_RAW:
+    period_list = _parse_multi(MULTI_PERIODS_RAW)
+    if period_list:
+        print("MULTI_PERIODS activo ->", ", ".join(period_list))
+    else:
+        print("Advertencia: MULTI_PERIODS definido pero vacío; usaré periodo objetivo.")
+
+if ONLY_TARGET_PERIOD or not period_list:
+    p_obj = TARGET_PERIOD or os.getenv("MODEL_PERIODO")
+    p_obj = _norm_period(p_obj)
+    if _has_rel("grupos") and p_obj:
+        c = _scalar(f"SELECT COUNT(*) FROM `{schema}`.`grupos` WHERE TRIM(CAST(periodo AS CHAR))=%s", (str(p_obj),))
+        if not c:
+            alt = _scalar(f"SELECT MAX(periodo) FROM `{schema}`.`grupos`")
+            if alt:
+                p_obj = str(alt)
+    period_list = [p_obj] if p_obj else [None]
+print("Periodos:", ", ".join(str(p) for p in period_list))
+
+# =============================
+# Acumuladores
+# =============================
+MG = []      # pares [m, g_key]
+G  = []      # lista g_key
+M  = []      # materias (ordenadas al final)
+size_G = {}  # tamaño por g_key
+P  = []      # RFCs
+
+rfcs_set = set()
+M_set    = set()
+seen_mg  = set()
+seen_g   = set()
+pm_direct = set()     # (rfc, materia) con experiencia directa
+Hreq_map  = {}        # "m|g_key" -> horas/semana detectadas
+
+CAREER_LEVEL_CODE   = os.getenv("MODEL_NIVEL", "L")
+CAREER_NAME_KEYWORD = os.getenv("MODEL_CARRERA_LIKE", "SISTEM")
+
+def _parse_carrera_pairs(raw):
+    out = []
+    if not raw:
+        return out
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            a,b = tok.split(":",1)
+            a = a.strip(); b = b.strip()
+            if a and b:
+                out.append((a,b))
+    return out
+
+# -----------------------------
+# Add row helper
+# -----------------------------
+def _add_row(materia, grupo, capacidad, inscritos, rfc, carrera, reticula, semestre, turno, periodo, horas):
+    m = _n(materia)
+    g_key = _mk_gkey(grupo, carrera, reticula, semestre, turno, periodo)
+    if not m or not g_key:
+        return
+    # Conjuntos básicos
+    if (m, g_key) not in seen_mg:
+        MG.append([m, g_key]); seen_mg.add((m, g_key))
+    if g_key not in seen_g:
+        G.append(g_key); seen_g.add(g_key)
+    M_set.add(m)
+    # Tamaño del grupo
+    cap = _safe_int(capacidad, None)
+    if cap is None:
+        cap = _safe_int(inscritos, None)
+    if cap is None:
+        cap = DEFAULT_GROUP_SIZE
+    size_G[g_key] = max(size_G.get(g_key, 0), cap)
+    # Profesor
+    r = _N(rfc)
+    if r:
+        rfcs_set.add(r)
+        pm_direct.add((r, m))
+    # Hreq reales si hay
+    if horas is not None:
+        try:
+            Hreq_map[f"{m}|{g_key}"] = int(horas)
+        except Exception:
+            pass
+
+# -----------------------------
+# Rutas de extracción
+# -----------------------------
+
+def _route_view(periodo):
+    view = "v_grupos_sistemas_actual"
+    if not _has_view(view):
+        return False
+    if not _scalar(f"SELECT COUNT(*) FROM `{schema}`.`{view}`"):
+        return False
+    cols = _cols(view)
+    cm = _pick(cols, ["materia","id_materia","clave_materia"])  
+    cg = _pick(cols, ["grupo"])  
+    cr = _pick(cols, ["rfc","profesor","id_personal","nombre"])  
+    cc = _pick(cols, ["capacidad_grupo","cupo","capacidad"])  
+    ci = _pick(cols, ["alumnos_inscritos","inscritos","matriculados"])  
+    ccarr = _pick(cols, ["carrera","id_carrera","clave_carrera"])  
+    cret  = _pick(cols, ["reticula","id_reticula","plan"])  
+    csem  = _pick(cols, ["semestre"])  
+    cturn = _pick(cols, ["turno"])  
+    cper  = _pick(cols, ["periodo"])  
+    chrs  = _pick(cols, ["horas_semana","hreq","horas"])  
+    if not cm or not cg:
+        return False
+    sql = (
+        f"SELECT `{cm}`, `{cg}`, "
+        f"{('`'+cc+'`') if cc else 'NULL'}, "
+        f"{('`'+ci+'`') if ci else 'NULL'}, "
+        f"{('`'+cr+'`') if cr else 'NULL'}, "
+        f"{('`'+ccarr+'`') if ccarr else 'NULL'}, "
+        f"{('`'+cret+'`')  if cret  else 'NULL'}, "
+        f"{('`'+csem+'`')  if csem  else 'NULL'}, "
+        f"{('`'+cturn+'`') if cturn else 'NULL'}, "
+        f"{('`'+cper+'`')  if cper  else 'NULL'}, "
+        f"{('`'+chrs+'`')  if chrs  else 'NULL'} "
+        f"FROM `{schema}`.`{view}`"
+    )
+    params = ()
+    if periodo and cper:
+        sql += f" WHERE TRIM(CAST(`{cper}` AS CHAR))=%s"
+        params = (str(periodo),)
+    rows = _fetchall(sql, params)
+    if not rows:
+        return False
+    for m,g,cap,ins,rfc,carr,ret,sem,tur,per,hrs in rows:
+        _add_row(m,g,cap,ins,rfc,carr,ret,sem,tur,(per if per is not None else periodo), hrs)
+    print("OK: usé vista v_grupos_sistemas_actual")
+    return True
+
+def _route_join_g_c(periodo):
+    if not (_has_rel("grupos") and _has_rel("carreras")):
+        return False
+    gcols = _cols("grupos"); ccols = _cols("carreras")
+    gm = _pick(gcols, ["materia","id_materia","clave_materia"])  
+    gg = _pick(gcols, ["grupo"])  
+    gr = _pick(gcols, ["rfc","id_personal","profesor","nombre"])  
+    gc = _pick(gcols, ["capacidad_grupo","cupo","capacidad"])  
+    gi = _pick(gcols, ["alumnos_inscritos","inscritos","matriculados"])  
+    gh = _pick(gcols, ["horas_semana","hreq","horas"])  
+    gp = _pick(gcols, ["periodo"])  
+    gs = _pick(gcols, ["semestre"])  
+    gt = _pick(gcols, ["turno"])  
+    gcarr = _pick(gcols, ["carrera","id_carrera","clave_carrera"])  
+    gret  = _pick(gcols, ["reticula","id_reticula","plan"])  
+
+    ccarr = _pick(ccols, ["carrera","id_carrera","clave_carrera"])  
+    cret  = _pick(ccols, ["reticula","id_reticula","plan"])  
+    clev  = _pick(ccols, ["nivel_escolar","nivel","nivel_academico"])  
+    cname = _pick(ccols, ["nombre_carrera","nombre","desc_carrera","descripcion","nombre_largo"])  
+
+    if not (gm and gg and gcarr and gret and ccarr and cret):
+        return False
+    where_parts, params = [], []
+    pairs = _parse_carrera_pairs(CAREER_ID_PAIRS_RAW)
+    if pairs:
+        sub = []
+        for a,b in pairs:
+            sub.append(f"(TRIM(CAST(c.`{ccarr}` AS CHAR))=%s AND TRIM(CAST(c.`{cret}` AS CHAR))=%s)")
+            params.extend([a,b])
+        where_parts.append("(" + " OR ".join(sub) + ")")
+    else:
+        if clev:
+            where_parts.append(f"c.`{clev}`=%s"); params.append(CAREER_LEVEL_CODE)
+        if cname:
+            where_parts.append(f"UPPER(c.`{cname}`) LIKE %s"); params.append(f"%{CAREER_NAME_KEYWORD.upper()}%")
+    if periodo and gp:
+        where_parts.append("TRIM(CAST(g.`periodo` AS CHAR))=%s"); params.append(str(periodo))
+    where = " AND ".join(where_parts) if where_parts else "1=1"
+
+    sql = f"""
+        SELECT g.`{gm}`, g.`{gg}`,
+               {('g.`'+gc+'`') if gc else 'NULL'},
+               {('g.`'+gi+'`') if gi else 'NULL'},
+               {('g.`'+gr+'`') if gr else 'NULL'},
+               g.`{gcarr}`, g.`{gret}`,
+               {(('g.`'+gs+'`') if gs else 'NULL')},
+               {(('g.`'+gt+'`') if gt else 'NULL')},
+               {(('g.`'+gp+'`') if gp else 'NULL')},
+               {(('g.`'+gh+'`') if gh else 'NULL')}
+        FROM `{schema}`.`grupos` g
+        JOIN `{schema}`.`carreras` c
+          ON TRIM(CAST(c.`{ccarr}` AS CHAR)) = TRIM(CAST(g.`{gcarr}` AS CHAR))
+         AND TRIM(CAST(c.`{cret}`  AS CHAR)) = TRIM(CAST(g.`{gret}`  AS CHAR))
+        WHERE {where}
+    """
+    rows = _fetchall(sql, tuple(params))
+    if not rows:
+        return False
+    print("JOIN g->c: filas=", len(rows))
+    for m,g,cap,ins,rfc,carr,ret,sem,tur,per,hrs in rows:
+        _add_row(m,g,cap,ins,rfc,carr,ret,sem,tur,(per if per is not None else periodo), hrs)
+    return True
+
+def _route_join_g_mc_c(periodo):
+    if not (_has_rel("grupos") and _has_rel("materias_carreras") and _has_rel("carreras")):
+        return False
+    gcols = _cols("grupos"); mc = _cols("materias_carreras"); ccols = _cols("carreras")
+    gm = _pick(gcols, ["materia","id_materia","clave_materia"])  
+    gg = _pick(gcols, ["grupo"])  
+    gr = _pick(gcols, ["rfc","id_personal","profesor","nombre"])  
+    gc = _pick(gcols, ["capacidad_grupo","cupo","capacidad"])  
+    gi = _pick(gcols, ["alumnos_inscritos","inscritos","matriculados"])  
+    gh = _pick(gcols, ["horas_semana","hreq","horas"])  
+    gp = _pick(gcols, ["periodo"])  
+    gs = _pick(gcols, ["semestre"])  
+    gt = _pick(gcols, ["turno"])  
+
+    mccarr = _pick(mc, ["carrera","id_carrera","clave_carrera"])  
+    mcret  = _pick(mc, ["reticula","id_reticula","plan"])  
+    mcmat  = _pick(mc, ["materia","id_materia","clave_materia"])  
+
+    ccarr = _pick(ccols, ["carrera","id_carrera","clave_carrera"])  
+    cret  = _pick(ccols, ["reticula","id_reticula","plan"])  
+    clev  = _pick(ccols, ["nivel_escolar","nivel","nivel_academico"])  
+    cname = _pick(ccols, ["nombre_carrera","nombre","desc_carrera","descripcion","nombre_largo"])  
+
+    if not (gm and gg and mccarr and mcret and mcmat and ccarr and cret):
+        return False
+
+    where_parts, params = [], []
+    pairs = _parse_carrera_pairs(CAREER_ID_PAIRS_RAW)
+    if pairs:
+        sub = []
+        for a,b in pairs:
+            sub.append(f"(TRIM(CAST(c.`{ccarr}` AS CHAR))=%s AND TRIM(CAST(c.`{cret}` AS CHAR))=%s)")
+            params.extend([a,b])
+        where_parts.append("("+" OR ".join(sub)+")")
+    else:
+        if clev:
+            where_parts.append(f"c.`{clev}`=%s"); params.append(CAREER_LEVEL_CODE)
+        if cname:
+            where_parts.append(f"UPPER(c.`{cname}`) LIKE %s"); params.append(f"%{CAREER_NAME_KEYWORD.upper()}%")
+    if periodo and gp:
+        where_parts.append("TRIM(CAST(g.`periodo` AS CHAR))=%s"); params.append(str(periodo))
+    where = " AND ".join(where_parts) if where_parts else "1=1"
+
+    sql = f"""
+        SELECT g.`{gm}`, g.`{gg}`,
+               {('g.`'+gc+'`') if gc else 'NULL'},
+               {('g.`'+gi+'`') if gi else 'NULL'},
+               {('g.`'+gr+'`') if gr else 'NULL'},
+               mc.`{mccarr}`, mc.`{mcret}`,
+               {(('g.`'+gs+'`') if gs else 'NULL')},
+               {(('g.`'+gt+'`') if gt else 'NULL')},
+               {(('g.`'+gp+'`') if gp else 'NULL')},
+               {(('g.`'+gh+'`') if gh else 'NULL')}
+        FROM `{schema}`.`grupos` g
+        JOIN `{schema}`.`materias_carreras` mc
+          ON TRIM(CAST(mc.`{mcmat}` AS CHAR)) = TRIM(CAST(g.`{gm}` AS CHAR))
+        JOIN `{schema}`.`carreras` c
+          ON TRIM(CAST(c.`{ccarr}` AS CHAR)) = TRIM(CAST(mc.`{mccarr}` AS CHAR))
+         AND TRIM(CAST(c.`{cret}`  AS CHAR)) = TRIM(CAST(mc.`{mcret}`  AS CHAR))
+        WHERE {where}
+    """
+    rows = _fetchall(sql, tuple(params))
+    if not rows:
+        return False
+    print("JOIN g->mc->c: filas=", len(rows))
+    for m,g,cap,ins,rfc,carr,ret,sem,tur,per,hrs in rows:
+        _add_row(m,g,cap,ins,rfc,carr,ret,sem,tur,(per if per is not None else periodo), hrs)
+    return True
+
+def _route_fallback_period(periodo):
+    if not _has_rel("grupos"):
+        return False
+    cols = _cols("grupos")
+    gm = _pick(cols, ["materia","id_materia","clave_materia"])  
+    gg = _pick(cols, ["grupo"])  
+    gr = _pick(cols, ["rfc","id_personal","profesor","nombre"])  
+    gc = _pick(cols, ["capacidad_grupo","cupo","capacidad"])  
+    gi = _pick(cols, ["alumnos_inscritos","inscritos","matriculados"])  
+    gp = _pick(cols, ["periodo"])  
+    gs = _pick(cols, ["semestre"])  
+    gt = _pick(cols, ["turno"])  
+    gh = _pick(cols, ["horas_semana","hreq","horas"])  
+    if not (gm and gg):
+        return False
+    sql = (
+        f"SELECT g.`{gm}`, g.`{gg}`, "
+        f"{('g.`'+gc+'`') if gc else 'NULL'}, "
+        f"{('g.`'+gi+'`') if gi else 'NULL'}, "
+        f"{('g.`'+gr+'`') if gr else 'NULL'}, "
+        f"{('g.`'+_pick(cols,['carrera','id_carrera','clave_carrera']) +'`') if _pick(cols,['carrera','id_carrera','clave_carrera']) else 'NULL'}, "
+        f"{('g.`'+_pick(cols,['reticula','id_reticula','plan']) +'`') if _pick(cols,['reticula','id_reticula','plan']) else 'NULL'}, "
+        f"{('g.`'+gs+'`') if gs else 'NULL'}, "
+        f"{('g.`'+gt+'`') if gt else 'NULL'}, "
+        f"{('g.`'+gp+'`') if gp else 'NULL'}, "
+        f"{('g.`'+gh+'`') if gh else 'NULL'} "
+        f"FROM `{schema}`.`grupos` g"
+    )
+    params = ()
+    if periodo and gp:
+        sql += " WHERE TRIM(CAST(g.`periodo` AS CHAR))=%s"
+        params = (str(periodo),)
+    rows = _fetchall(sql, params)
+    if not rows:
+        return False
+    print("Fallback: todos los grupos del periodo")
+    for m,g,cap,ins,rfc,carr,ret,sem,tur,per,hrs in rows:
+        _add_row(m,g,cap,ins,rfc,carr,ret,sem,tur,(per if per is not None else periodo), hrs)
+    return True
+
+# =============================
+# EF auto (solo permisivo)
+# =============================
+
+def _detect_horarios_cols():
+    if not _has_rel("horarios"):
+        return None
+    hcols = _cols("horarios")
+    return {
+        "aula": _pick(hcols, ["aula","salon","aula_asignada","clave_aula"]),
+        "per":  _pick(hcols, ["periodo"]),
+        "mat":  _pick(hcols, ["materia","id_materia","clave_materia"]),
+        "grp":  _pick(hcols, ["grupo"]),
+    }
+
+def _count_use(periodo, rooms):
+    usage = {a: 0 for a in rooms}
+    cols = _detect_horarios_cols()
+    if not cols or not cols["aula"]:
+        return usage
+    if cols["per"]:
+        sql = f"""
+            SELECT UPPER(TRIM(CAST({cols['aula']} AS CHAR))) aula, COUNT(*) c
+            FROM `{schema}`.`horarios`
+            WHERE TRIM(CAST({cols['per']} AS CHAR))=%s
+            GROUP BY UPPER(TRIM(CAST({cols['aula']} AS CHAR)))
+        """
+        for a,c in _fetchall(sql, (str(periodo),)):
+            a = _N(a)
+            if a in usage:
+                usage[a] = _safe_int(c, 0) or 0
+        return usage
+    return usage
+
+def _select_ef_rooms(periodo):
+    if EF_SELECTION_COUNT <= 0:
+        return []
+    if not A_db:
+        return []
+    E = sorted([a for a in A_db if a.startswith("E")])
+    F = sorted([a for a in A_db if a.startswith("F")])
+    useE = _count_use(periodo, E) if E else {}
+    useF = _count_use(periodo, F) if F else {}
+    def rank(cands, use):
+        return sorted(cands, key=lambda a: (-cap_A_db.get(a, DEFAULT_AULA_CAP), use.get(a,0), a))[:EF_SELECTION_COUNT]
+    return rank(E, useE) + rank(F, useF)
+
+# =============================
+# Emisión JSON
+# =============================
+
+def _compute_out_path(base_tpl, periodo):
+    if any(sym in base_tpl for sym in ["*","?","["]):
+        base_tpl = base_tpl.replace("*", "{periodo}")
+    if "{periodo}" in base_tpl:
+        try:
+            return base_tpl.format(periodo=periodo or "ALL")
+        except Exception:
+            pass
+    root, ext = os.path.splitext(base_tpl)
+    ext = ext if ext else ".json"
+    return f"{root}_{periodo or 'ALL'}{ext}"
+
+
+def _emit_json(out_path, periodo, AT_list, AL_list, A_list, A_tipo):
+    global P, M
+    # STRICT: sin EF ni expansiones
+    if STRICT_ROOMSETS:
+        A_list = list(AT_list) + list(AL_list)
+    else:
+        # Permisivo: asegurar capacidades
+        if len(A_list) < max(1, len(MG)*2) and A_db:
+            A_list = sorted(set(A_list) | set(A_db))
+    cap_A = {a: cap_A_db.get(a, DEFAULT_AULA_CAP) for a in A_list}
+
+    P = sorted(rfcs_set)
+    M = sorted(M_set)
+
+    # Afinidades base
+    a_pm = {f"{p}|{m}": A_PM_NINGUNA for p in P for m in M}
+    for (p, m) in pm_direct:
+        if p in rfcs_set and m in M_set:
+            a_pm[f"{p}|{m}"] = A_PM_DIRECTA
+
+    # Hreq con default
+    Hreq = {}
+    for (m, g) in MG:
+        k = f"{m}|{g}"
+        Hreq[k] = Hreq_map.get(k, DEFAULT_HREQ)
+
+    MinH = {p: DEFAULT_MINH for p in P}
+    MaxH = {p: DEFAULT_MAXH for p in P}
+    U = {}
+
+    payload = {
+        "P": P, "A": A_list, "D": D, "H": H, "M": M, "G": G, "MG": MG,
+        "cap_A": cap_A, "size_G": size_G,
+        "a_pm": a_pm, "Hreq": Hreq, "MinH": MinH, "MaxH": MaxH, "U": U,
+        "AT": sorted(AT_list), "AL": sorted(AL_list),
+        "EF_auto": [],
+        "AL_sem1_extras": SEM1_EXTRAS,
+        "A_tipo": A_tipo,
+        "PERIODO": periodo,
+        "STRICT_ROOMSETS": STRICT_ROOMSETS,
+    }
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print("Listo:", out_path)
+    print(f"|P|={len(P)} |M|={len(M)} |G|={len(G)} |MG|={len(MG)} |A|={len(A_list)}  PERIODO={periodo}")
+
+# =============================
+# MAIN loop por periodo
+# =============================
+print(f"Periodo objetivo = {TARGET_PERIOD}")
+print(f"Solo periodo objetivo = {'SI' if ONLY_TARGET_PERIOD else 'NO'}")
+
+for idx, per in enumerate(period_list, 1):
+    print("\n=== Construcción ", f"({idx}/{len(period_list)}) periodo={per if per else 'SIN_FILTRO'}")
+    # reset acumuladores
+    MG.clear(); G.clear(); M.clear(); size_G.clear(); P.clear()
+    rfcs_set.clear(); M_set.clear(); seen_mg.clear(); seen_g.clear(); pm_direct.clear(); Hreq_map.clear()
+
+    ok = _route_view(per)
+    if not ok:
+        ok = _route_join_g_c(per)
+    if not ok:
+        ok = _route_join_g_mc_c(per)
+    if not ok:
+        ok = _route_fallback_period(per)
+    if not ok:
+        print("No se pudieron extraer grupos para este periodo; continúo.")
+        continue
+
+    # Conjunto de aulas y tipos
+    if STRICT_ROOMSETS:
+        A = sorted(AT_CONF | AL_CONF)
+    else:
+        EF_auto = _select_ef_rooms(per)
+        A = sorted(set(A_db) | AT_CONF | AL_CONF | set(EF_auto))
+    A_tipo = _build_A_tipo(A)
+
+    out_path = _compute_out_path(DATOS_JSON_TPL, per)
+    _emit_json(out_path, per, sorted(AT_CONF), sorted(AL_CONF), A, A_tipo)
+
+try:
+    cur.close(); conn.close()
+except Exception:
+    pass
+
+print("\n=== Resumen final ===")
+print("AT:", len(AT_CONF), "AL:", len(AL_CONF))
+print("D:", D)
+print("H:", H)
